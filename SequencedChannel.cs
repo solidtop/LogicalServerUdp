@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
+﻿using System.Threading.Channels;
 
 namespace LogicalServerUdp
 {
@@ -36,6 +32,10 @@ namespace LogicalServerUdp
                     {
                         _packetBuffer[sequenceNumber] = packet;
                     }
+                }
+                else
+                {
+                    Console.WriteLine("Packet loss");
                 }
             }
         }

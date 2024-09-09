@@ -1,11 +1,5 @@
-﻿using System;
-using LogicalServerUdp;
+﻿using LogicalServerUdp;
 
-var manager = new NetManager();
-manager.Start(8000);
+var server = new TestServer();
+server.StartServer();
 
-Console.WriteLine("Server started... Press enter to stop");
-
-Console.ReadLine();
-
-manager.Stop();

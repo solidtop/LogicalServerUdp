@@ -18,14 +18,22 @@ namespace LogicalServerUdp
             var writer = new MessagePackWriter(buffer);
 
             writer.Write((byte)Type);
-            writer.Write(SequenceNumber);
 
-            if (Payload.Length > 0)
+            switch (Type)
             {
-                writer.Write(Payload);
+                case PacketType.Reliable:
+                case PacketType.Sequenced:
+                    writer.Write(SequenceNumber);
+                    break;
             }
 
             writer.Flush();
+
+            if (Payload.Length > 0)
+            {
+                buffer.Write(Payload);
+            }
+
             return buffer.WrittenSpan.ToArray();
         }
 
@@ -34,16 +42,26 @@ namespace LogicalServerUdp
             var reader = new MessagePackReader(buffer);
 
             var type = (PacketType)reader.ReadByte();
-            var sequenceNumber = reader.ReadInt32();
 
-            var headerSize = reader.Consumed;
-            var payloadSize = buffer.Length - headerSize;
+            var sequenceNumber = 0;
+
+            switch (type)
+            {
+                case PacketType.Ping:
+                    return Create(type);
+                case PacketType.Reliable:
+                case PacketType.Sequenced:
+                    sequenceNumber = reader.ReadInt32();
+                    break;
+            }
+
+            int headerSize = (int)reader.Consumed;
+            int payloadSize = buffer.Length - headerSize;
 
             if (payloadSize > 0)
             {
-                byte[] payload = new byte[payloadSize];
-                Array.Copy(buffer, headerSize, payload, 0, payloadSize);
-                return new Packet(type, sequenceNumber, payload);
+                ReadOnlySpan<byte> payload = buffer.AsSpan(headerSize, payloadSize);
+                return new Packet(type, sequenceNumber, payload.ToArray());
             }
 
             return new Packet(type, sequenceNumber, []);

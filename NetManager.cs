@@ -1,17 +1,20 @@
-﻿using System;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Threading.Channels;
+using LogicalServerUdp.Events;
+using MessagePack;
 
 namespace LogicalServerUdp
 {
-    public class NetManager
+    public class NetManager(IEventListener eventListener)
     {
         private readonly CancellationTokenSource _tokenSource = new();
         private readonly ConcurrentDictionary<IPEndPoint, Client> _clients = [];
+        private readonly IEventListener _eventListener = eventListener;
+        private readonly Channel<(byte[], IPEndPoint)> _sendChannel = Channel.CreateUnbounded<(byte[], IPEndPoint)>();
         private Task? _receiveTask;
+        private Task? _sendTask;
         private UdpClient? _server;
         private bool _isRunning;
 
@@ -26,6 +29,7 @@ namespace LogicalServerUdp
 
             var token = _tokenSource.Token;
             _receiveTask = Task.Run(() => ReceivePacketsAsync(token), token);
+            _sendTask = Task.Run(() => ProcessOutgoingPacketsAsync(token), token);
         }
 
         public void Stop()
@@ -37,12 +41,8 @@ namespace LogicalServerUdp
             _isRunning = false;
             _tokenSource.Cancel();
             _receiveTask?.Wait();
+            _sendTask?.Wait();
             _server?.Close();
-        }
-
-        public void Send(Packet packet, IPEndPoint endpoint)
-        {
-            var data = packet.ToBytes();
         }
 
         private async Task ReceivePacketsAsync(CancellationToken cancellationToken)
@@ -59,16 +59,15 @@ namespace LogicalServerUdp
                     try
                     {
                         var result = await _server.ReceiveAsync(cancellationToken);
-                        var endpoint = result.RemoteEndPoint;
+                        var endPoint = result.RemoteEndPoint;
 
-                        if (!_clients.TryGetValue(endpoint, out var client))
+                        if (!_clients.TryGetValue(endPoint, out var client))
                         {
-                            client = new Client(endpoint, this);
-                            _clients.TryAdd(endpoint, client);
+                            client = new Client(endPoint, this);
+                            _clients.TryAdd(endPoint, client);
                         }
 
-                        var packet = Packet.FromBytes(result.Buffer);
-                        client.ProcessPacket(packet, cancellationToken);
+                        await ProcessPacketAsync(client, result.Buffer, cancellationToken);
                     }
                     catch (OperationCanceledException)
                     {
@@ -94,7 +93,7 @@ namespace LogicalServerUdp
             }
         }
 
-        private void ProcessPacket(Client client, byte[] buffer, CancellationToken cancellationToken)
+        private async Task ProcessPacketAsync(Client client, byte[] buffer, CancellationToken cancellationToken)
         {
             var packet = Packet.FromBytes(buffer);
 
@@ -104,12 +103,92 @@ namespace LogicalServerUdp
                     break;
                 case PacketType.Disconnect:
                     break;
-                case PacketType.Ping:
+                default:
+                    await client.ProcessPacketAsync(packet, cancellationToken);
                     break;
             }
+        }
 
-            Console.WriteLine($"Received packet: {packet.Type}");
-            Console.WriteLine($"Payload size: {packet.Payload.Length}");
+        private async Task ProcessOutgoingPacketsAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await foreach (var (data, endPoint) in _sendChannel.Reader.ReadAllAsync(cancellationToken))
+                {
+                    await SendRawAsync(data, endPoint);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in outgoing packet processing: {ex.Message}");
+            }
+        }
+
+        internal void RaiseEvent(EventType type, Client client, Packet packet)
+        {
+            switch (type)
+            {
+                case EventType.Connect:
+                    break;
+                case EventType.Disconnect:
+                    break;
+                case EventType.ReceivePacket:
+                    var reader = new MessagePackReader(packet.Payload);
+                    _eventListener.OnPacketReceived(client, reader);
+                    break;
+            }
+        }
+
+        public async Task SendRawAsync(byte[] data, IPEndPoint endPoint)
+        {
+            if (_server is null)
+                return;
+
+            try
+            {
+                await _server.SendAsync(data, data.Length, endPoint);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while sending packet to {endPoint}: {ex.Message}");
+            }
+        }
+
+        public async Task SendAsync(byte[] data, IPEndPoint endpoint)
+        {
+            try
+            {
+                await _sendChannel.Writer.WriteAsync((data, endpoint), _tokenSource.Token);
+            }
+            catch (ChannelClosedException)
+            {
+                Console.WriteLine("Send channel is closed, unable to send packet.");
+            }
+        }
+
+        public async Task SendToAll(byte[] data)
+        {
+            await SendToAll(data, []);
+        }
+
+        public async Task SendToAll(byte[] data, IReadOnlyList<IPEndPoint> excludedEndPoints)
+        {
+            foreach (var pair in _clients)
+            {
+                var endPoint = pair.Key;
+
+                if (excludedEndPoints.Contains(endPoint))
+                {
+                    continue;
+                }
+
+                var client = pair.Value;
+                await client.SendAsync(data);
+            }
         }
     }
 }

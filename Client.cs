@@ -1,37 +1,53 @@
-﻿using System;
-using System.Net;
-using System.Threading;
+﻿using System.Net;
+using LogicalServerUdp.Events;
 
 namespace LogicalServerUdp
 {
-    public class Client(IPEndPoint endPoint, NetManager netManager)
+    public class Client
     {
-        private readonly NetManager _netManager = netManager;
+        private readonly NetManager _netManager;
         private readonly SequencedChannel _sequencedChannel = new();
+        private readonly CancellationTokenSource _tokenSource = new();
+        private int _sequenceNumber = 0;
 
-        public IPEndPoint EndPoint { get; } = endPoint;
+        private readonly byte[] _pongPacket = Packet.Create(PacketType.Pong).ToBytes();
 
-        internal void ProcessPacket(Packet packet, CancellationToken cancellationToken)
+        public IPEndPoint EndPoint { get; }
+
+        public Client(IPEndPoint endPoint, NetManager netManager)
+        {
+            EndPoint = endPoint;
+            _netManager = netManager;
+
+            var token = _tokenSource.Token;
+
+            Task.Run(() => _sequencedChannel.ProcessPacketsAsync(packet =>
+                _netManager.RaiseEvent(EventType.ReceivePacket, this, packet), token), token);
+        }
+
+        internal async Task ProcessPacketAsync(Packet packet, CancellationToken cancellationToken)
         {
             switch (packet.Type)
             {
                 case PacketType.Unreliable:
-
+                    _netManager.RaiseEvent(EventType.ReceivePacket, this, packet);
                     break;
                 case PacketType.Reliable:
 
                     break;
                 case PacketType.Sequenced:
-                    _ = _sequencedChannel.EnqueuePacketAsync(packet, cancellationToken);
+                    await _sequencedChannel.EnqueuePacketAsync(packet, cancellationToken);
                     break;
                 case PacketType.Ping:
-                    var pongPacket = Packet.Create(PacketType.Pong);
-                    _netManager.Send(pongPacket, EndPoint);
+                    await _netManager.SendAsync(_pongPacket, EndPoint);
                     break;
             }
+        }
 
-            Console.WriteLine($"Received packet: {packet.Type}");
-            Console.WriteLine($"Payload size: {packet.Payload.Length}");
+        public async Task SendAsync(byte[] data, DeliveryMethod deliveryMethod)
+        {
+            var packet = new Packet(PacketType.Sequenced, _sequenceNumber++, data);
+            await _netManager.SendAsync(packet.ToBytes(), EndPoint);
         }
     }
 }
