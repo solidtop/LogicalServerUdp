@@ -67,9 +67,24 @@ namespace LogicalServerUdp
             return new Packet(type, sequenceNumber, []);
         }
 
+        public static Packet Create(PacketType type, int sequenceNumber, byte[] payload)
+        {
+            return new Packet(type, sequenceNumber, payload);
+        }
+
+        public static Packet Create(PacketType type, byte[] payload)
+        {
+            return new Packet(type, 0, payload);
+        }
+
         public static Packet Create(PacketType type)
         {
             return new Packet(type, 0, []);
+        }
+
+        public static Packet CreateAck(int sequenceNumber)
+        {
+            return Create(PacketType.Ack, sequenceNumber, []);
         }
     }
 }

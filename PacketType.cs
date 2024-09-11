@@ -7,8 +7,8 @@
         Ack,
         Ping,
         Pong,
-        Unreliable,
         Reliable,
         Sequenced,
+        Unreliable,
     }
 }

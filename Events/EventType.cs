@@ -4,6 +4,6 @@
     {
         Connect,
         Disconnect,
-        ReceivePacket,
+        Receive,
     }
 }

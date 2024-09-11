@@ -3,7 +3,7 @@
     public enum DeliveryMethod
     {
         Reliable,
-        Unreliable,
         Sequenced,
+        Unreliable,
     }
 }

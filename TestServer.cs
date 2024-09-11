@@ -6,6 +6,7 @@ namespace LogicalServerUdp
     public class TestServer : IEventListener
     {
         private readonly NetManager _netManager;
+        private readonly NetStatistics _statistics = new();
 
         public TestServer()
         {
@@ -15,24 +16,29 @@ namespace LogicalServerUdp
         public void StartServer()
         {
             _netManager.Start(8000);
+        }
 
-            Console.WriteLine("Server started... Press enter to stop");
+        public void OnClientConnected(Client client)
+        {
+            Console.WriteLine($"Client {client.EndPoint} connected");
+        }
 
-            Console.ReadLine();
-
-            _netManager.Stop();
+        public void OnClientDisconnected(Client client, string? reason)
+        {
+            Console.WriteLine($"Client disconnected with reason: {reason}");
         }
 
         public void OnPacketReceived(Client client, MessagePackReader reader)
         {
-            var magicNum = reader.ReadUInt16();
+            var magicNum = reader.ReadString();
             Console.WriteLine($"Received packet from {client.EndPoint}: {magicNum}");
 
             //var inputPacket = new InputPacket("Hello client! This is amazing");
             //var data = Serialize(inputPacket);
-            ////_ = client.SendAsync(data);
 
-            //_ = _netManager.SendToAll(data);
+            //_netManager.SendToAll(data, DeliveryMethod.Reliable);
+            var data = Serialize(69);
+            client.Send(data, DeliveryMethod.Sequenced);
         }
 
         private byte[] Serialize(object packet)

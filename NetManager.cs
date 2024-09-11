@@ -4,24 +4,34 @@ using System.Net.Sockets;
 using System.Threading.Channels;
 using LogicalServerUdp.Events;
 using MessagePack;
+using Microsoft.Extensions.Logging;
 
 namespace LogicalServerUdp
 {
-    public class NetManager(IEventListener eventListener)
+    public class NetManager(IEventListener eventListener) : IDisposable
     {
         private readonly CancellationTokenSource _tokenSource = new();
         private readonly ConcurrentDictionary<IPEndPoint, Client> _clients = [];
         private readonly IEventListener _eventListener = eventListener;
         private readonly Channel<(byte[], IPEndPoint)> _sendChannel = Channel.CreateUnbounded<(byte[], IPEndPoint)>();
-        private Task? _receiveTask;
-        private Task? _sendTask;
         private UdpClient? _server;
         private bool _isRunning;
+
+        private Task? _receiveTask;
+        private Task? _sendTask;
+        private Task? _timeoutTask;
+
+        private readonly TimeSpan _timeout = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _timeoutInterval = TimeSpan.FromSeconds(5);
+
+        private readonly ILogger<NetManager> _logger = NetLoggerFactory.CreateLogger<NetManager>();
 
         public void Start(int port)
         {
             if (_isRunning)
                 return;
+
+            _logger.LogInformation("Server started on port {port}... Press enter to stop.", port);
 
             _isRunning = true;
 
@@ -30,6 +40,11 @@ namespace LogicalServerUdp
             var token = _tokenSource.Token;
             _receiveTask = Task.Run(() => ReceivePacketsAsync(token), token);
             _sendTask = Task.Run(() => ProcessOutgoingPacketsAsync(token), token);
+            _timeoutTask = Task.Run(() => TimeoutClientsAsync(token), token);
+
+            Console.ReadLine();
+
+            Stop();
         }
 
         public void Stop()
@@ -37,12 +52,8 @@ namespace LogicalServerUdp
             if (!_isRunning)
                 return;
 
-            Console.WriteLine("Server shutting down...");
-            _isRunning = false;
-            _tokenSource.Cancel();
-            _receiveTask?.Wait();
-            _sendTask?.Wait();
-            _server?.Close();
+            _logger.LogInformation("Server shutting down...");
+            Dispose();
         }
 
         private async Task ReceivePacketsAsync(CancellationToken cancellationToken)
@@ -65,9 +76,10 @@ namespace LogicalServerUdp
                         {
                             client = new Client(endPoint, this);
                             _clients.TryAdd(endPoint, client);
+                            _eventListener.OnClientConnected(client);
                         }
 
-                        await ProcessPacketAsync(client, result.Buffer, cancellationToken);
+                        await client.ProcessPacketAsync(result.Buffer, cancellationToken);
                     }
                     catch (OperationCanceledException)
                     {
@@ -79,33 +91,17 @@ namespace LogicalServerUdp
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error while processing packet: {ex.Message}");
+                        _logger.LogError(ex, "Error while processing packet.");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error while receiving packets: {ex.Message}");
+                _logger.LogError(ex, "Error while receiving packets.");
             }
             finally
             {
                 Stop();
-            }
-        }
-
-        private async Task ProcessPacketAsync(Client client, byte[] buffer, CancellationToken cancellationToken)
-        {
-            var packet = Packet.FromBytes(buffer);
-
-            switch (packet.Type)
-            {
-                case PacketType.Connect:
-                    break;
-                case PacketType.Disconnect:
-                    break;
-                default:
-                    await client.ProcessPacketAsync(packet, cancellationToken);
-                    break;
             }
         }
 
@@ -115,7 +111,7 @@ namespace LogicalServerUdp
             {
                 await foreach (var (data, endPoint) in _sendChannel.Reader.ReadAllAsync(cancellationToken))
                 {
-                    await SendRawAsync(data, endPoint);
+                    await SendCoreAsync(data, endPoint);
                 }
             }
             catch (OperationCanceledException)
@@ -124,58 +120,87 @@ namespace LogicalServerUdp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in outgoing packet processing: {ex.Message}");
+                _logger.LogError(ex, "Error processing outgoing packet.");
             }
         }
 
         internal void RaiseEvent(EventType type, Client client, Packet packet)
         {
+            var reader = new MessagePackReader(packet.Payload);
+
             switch (type)
             {
                 case EventType.Connect:
                     break;
                 case EventType.Disconnect:
+                    var reason = reader.ReadString();
+                    DisconnectClient(client, reason);
                     break;
-                case EventType.ReceivePacket:
-                    var reader = new MessagePackReader(packet.Payload);
+                case EventType.Receive:
                     _eventListener.OnPacketReceived(client, reader);
                     break;
             }
         }
 
-        public async Task SendRawAsync(byte[] data, IPEndPoint endPoint)
+        internal void RaiseReceiveEvent(Client client, Packet packet)
         {
-            if (_server is null)
-                return;
+            var reader = new MessagePackReader(packet.Payload);
+            _eventListener.OnPacketReceived(client, reader);
+        }
 
-            try
+        internal void DisconnectClient(Client client, string? reason)
+        {
+            _logger.LogDebug("Disconnecting client {endPoint}", client.EndPoint);
+
+            _eventListener.OnClientDisconnected(client, reason);
+
+            _clients.TryRemove(client.EndPoint, out _);
+
+            client.Dispose();
+        }
+
+        private async Task TimeoutClientsAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                await _server.SendAsync(data, data.Length, endPoint);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error while sending packet to {endPoint}: {ex.Message}");
+                var now = DateTime.UtcNow;
+
+                foreach (var client in _clients.Values)
+                {
+                    if (now - client.LastPingTime > _timeout)
+                    {
+                        _logger.LogDebug("Client {endPoint} time out.", client.EndPoint);
+                        DisconnectClient(client, "Client timed out.");
+                    }
+                }
+
+                await Task.Delay(_timeoutInterval, cancellationToken);
             }
         }
 
-        public async Task SendAsync(byte[] data, IPEndPoint endpoint)
+        public async Task SendAsync(byte[] data, IPEndPoint endPoint)
         {
             try
             {
-                await _sendChannel.Writer.WriteAsync((data, endpoint), _tokenSource.Token);
+                await _sendChannel.Writer.WriteAsync((data, endPoint), _tokenSource.Token);
             }
             catch (ChannelClosedException)
             {
-                Console.WriteLine("Send channel is closed, unable to send packet.");
+                _logger.LogDebug("Send channel is closed, unable to send packet.");
             }
         }
 
-        public async Task SendToAll(byte[] data)
+        public void Send(byte[] data, IPEndPoint endPoint)
         {
-            await SendToAll(data, []);
+            _ = SendAsync(data, endPoint);
         }
 
-        public async Task SendToAll(byte[] data, IReadOnlyList<IPEndPoint> excludedEndPoints)
+        public void SendToAll(byte[] data, DeliveryMethod deliveryMethod)
+        {
+            SendToAll(data, deliveryMethod, []);
+        }
+
+        public void SendToAll(byte[] data, DeliveryMethod deliveryMethod, IReadOnlyList<IPEndPoint> excludedEndPoints)
         {
             foreach (var pair in _clients)
             {
@@ -187,8 +212,53 @@ namespace LogicalServerUdp
                 }
 
                 var client = pair.Value;
-                await client.SendAsync(data);
+                client.Send(data, deliveryMethod);
             }
+        }
+
+        public async Task SendToAllAsync(byte[] data, DeliveryMethod deliveryMethod, IReadOnlyList<IPEndPoint> excludedEndPoints)
+        {
+            var sendTasks = new List<Task>();
+
+            foreach (var pair in _clients)
+            {
+                var endPoint = pair.Key;
+
+                if (excludedEndPoints.Contains(endPoint))
+                    continue;
+
+                var client = pair.Value;
+                sendTasks.Add(client.SendAsync(data, deliveryMethod));
+            }
+
+            await Task.WhenAll(sendTasks);
+        }
+
+        private async Task SendCoreAsync(byte[] data, IPEndPoint endPoint)
+        {
+            if (_server is null)
+                return;
+
+            try
+            {
+                await _server.SendAsync(data, data.Length, endPoint);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while sending packet to {endPoint}", endPoint);
+            }
+        }
+
+        public void Dispose()
+        {
+            _isRunning = false;
+            _tokenSource.Cancel();
+            _receiveTask?.Wait();
+            _sendTask?.Wait();
+            _timeoutTask?.Dispose();
+            _server?.Close();
+
+            GC.SuppressFinalize(this);
         }
     }
 }
